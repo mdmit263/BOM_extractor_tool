@@ -86,7 +86,7 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
 <div class="wrap">
   <header>
     <h1>BOM Extractor</h1>
-    <p class="sub">Add one or more BOM Excel files. You get one Excel sheet with everything in a single tab and only the 8 columns you need. Planning Date stays empty for people to fill in.</p>
+    <p class="sub">Add one or more BOM Excel files. You get one Excel file with a tab for each BOM tab, and only the 8 columns you need. Planning Date stays empty for people to fill in.</p>
   </header>
 
   <section class="card">
@@ -101,7 +101,7 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
   </section>
 
   <section class="card" id="review" hidden>
-    <div class="step"><b>2</b> Check what will be pulled (all goes into one sheet)</div>
+    <div class="step"><b>2</b> Check what will be pulled</div>
     <div id="sheets" style="display:flex;flex-direction:column;gap:12px"></div>
     <details>
       <summary>Settings (fixed values from the NAV work instruction)</summary>
@@ -109,7 +109,6 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
         <label>Type<input id="sType" value="Item"></label>
         <label>Line Type<input id="sLT" value="Schedule"></label>
         <label>Qty Per Unit<input id="sQPU" type="number" value="1" min="0" step="any"></label>
-        <label style="flex-direction:row;align-items:center;gap:8px;grid-column:1/-1"><input id="sSrc" type="checkbox" style="width:auto"> Add a Source column showing which BOM tab each row came from</label>
         <label>Line No. starts at<input id="sStart" type="number" value="10000" min="0"></label>
         <label>Line No. step<input id="sStep" type="number" value="10000" min="1"></label>
       </div>
@@ -129,7 +128,7 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
     <div class="tw"><table class="map">
       <thead><tr><th>Output column</th><th>Taken from the BOM</th></tr></thead>
       <tbody>
-        <tr><td>Line No.</td><td>Numbered automatically across the whole sheet: 10000, 20000, 30000...</td></tr>
+        <tr><td>Line No.</td><td>Numbered automatically on each tab: 10000, 20000, 30000...</td></tr>
         <tr><td>Type</td><td>"Item" for every row</td></tr>
         <tr><td>No.</td><td>NAV Part No. (left blank when the BOM has none, those items need an RFX)</td></tr>
         <tr><td>Line Type</td><td>"Schedule" for every row</td></tr>
@@ -139,6 +138,7 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
         <tr><td>Description</td><td>Description</td></tr>
       </tbody>
     </table></div>
+    <p class="foot" style="margin:0">Rules follow work instruction "Material Entry into NAV" (Doc 215448, revision 8). Only rows with a description and a quantity above 0 are kept, so empty template rows are dropped. Hidden tabs such as inventory are ignored. Your files are read in this browser and are not uploaded anywhere.</p>
   </section>
 </div>
 
@@ -297,7 +297,7 @@ function render(){
   const n=totalRows();
   $("dl").disabled=n===0;
   $("dlmsg").className="foot";
-  $("dlmsg").textContent=n?`${n} rows from the selected tabs go into one sheet.`:"Nothing selected yet.";
+  $("dlmsg").textContent=n?`${n} rows on ${parsed.reduce((a,p)=>a+p.sheets.filter(s=>s.on).length,0)} tab${parsed.reduce((a,p)=>a+p.sheets.filter(s=>s.on).length,0)>1?"s":""} will be saved, one tab per BOM tab.`:"Nothing selected yet.";
 }
 const totalRows=()=>parsed.reduce((a,p)=>a+p.sheets.filter(s=>s.on).reduce((x,s)=>x+s.rows.length,0),0);
 function sheetHTML(s,pi,si){
@@ -323,50 +323,53 @@ const STYLES=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet
 
 function collect(){
   const start=+$("sStart").value||10000, step=+$("sStep").value||10000, type=$("sType").value, lt=$("sLT").value, qpu=+$("sQPU").value||1;
-  const src=$("sSrc").checked, multi=parsed.length>1, rows=[]; let i=0;
+  const multi=parsed.length>1, used=new Set(), sheets=[]; let total=0;
   for(const p of parsed)for(const s of p.sheets){
     if(!s.on)continue;
-    for(const r of s.rows){
-      const row=[start+i*step,r.type||type,r.no,r.lt||lt,null,r.per!=null&&r.per!==""?r.per:qpu,r.qty,r.desc];
-      if(src)row.push(multi?p.tag+" / "+s.title:s.title);
-      rows.push(row); i++;
-    }
+    let name=((multi?p.tag+" ":"")+s.title).replace(/[\\\/\?\*\[\]:]/g,"-").trim().slice(0,31)||"Sheet";
+    for(let k=2;used.has(name.toLowerCase());k++)name=name.slice(0,31-String(k).length-1)+"_"+k;
+    used.add(name.toLowerCase());
+    const rows=s.rows.map((r,i)=>[start+i*step,r.type||type,r.no,r.lt||lt,null,r.per!=null&&r.per!==""?r.per:qpu,r.qty,r.desc]);
+    sheets.push({name,rows}); total+=rows.length;
   }
-  return{rows,heads:src?[...OUT,"Source"]:OUT};
+  return{sheets,heads:OUT,total};
 }
-async function buildXlsx({rows,heads}){
-  const nc=heads.length, last=rows.length+1, widths=[10,9,12,11,15,13,11,60,24].slice(0,nc);
+function sheetXML(rows,heads){
+  const nc=heads.length, last=rows.length+1, widths=[10,9,12,11,15,13,11,60];
   let sd=`<row r="1" ht="30" customHeight="1">${heads.map((h,c)=>cellXML(L(c+1)+"1",h,1)).join("")}</row>`;
-  rows.forEach((r,i)=>{
-    const n=i+2;
-    sd+=`<row r="${n}">${r.map((v,c)=>cellXML(L(c+1)+n,v,c===4?4:c===7?3:2)).join("")}</row>`;
-  });
-  const sheet=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:${L(nc)}${last}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>${widths.map((w,i)=>`<col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${sd}</sheetData><autoFilter ref="A1:${L(nc)}${last}"/></worksheet>`;
-  const z=new JSZip();
-  z.file("[Content_Types].xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`);
-  z.file("_rels/.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
-  z.file("xl/workbook.xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${NS_R}"><sheets><sheet name="BOM" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">BOM!$A$1:$${L(nc)}$${last}</definedName></definedNames></workbook>`);
-  z.file("xl/_rels/workbook.xml.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`);
+  rows.forEach((r,i)=>{const n=i+2;sd+=`<row r="${n}">${r.map((v,c)=>cellXML(L(c+1)+n,v,c===4?4:c===7?3:2)).join("")}</row>`});
+  return`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:${L(nc)}${last}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>${widths.map((w,i)=>`<col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${sd}</sheetData><autoFilter ref="A1:${L(nc)}${last}"/></worksheet>`;
+}
+async function buildXlsx({sheets,heads}){
+  const z=new JSZip(), n=sheets.length, nc=heads.length;
+  const REL="http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  z.file("[Content_Types].xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((_,i)=>`<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`);
+  z.file("_rels/.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+  z.file("xl/workbook.xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${NS_R}"><sheets>${sheets.map((s,i)=>`<sheet name="${X(s.name).replace(/"/g,"&quot;")}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join("")}</sheets><definedNames>${sheets.map((s,i)=>`<definedName name="_xlnm._FilterDatabase" localSheetId="${i}" hidden="1">'${X(s.name).replace(/'/g,"''")}'!$A$1:$${L(nc)}$${s.rows.length+1}</definedName>`).join("")}</definedNames></workbook>`);
+  z.file("xl/_rels/workbook.xml.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_,i)=>`<Relationship Id="rId${i+1}" Type="${REL}/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join("")}<Relationship Id="rId${n+1}" Type="${REL}/styles" Target="styles.xml"/></Relationships>`);
   z.file("xl/styles.xml",STYLES);
-  z.file("xl/worksheets/sheet1.xml",sheet);
+  sheets.forEach((s,i)=>z.file(`xl/worksheets/sheet${i+1}.xml`,sheetXML(s.rows,heads)));
   return z.generateAsync({type:"arraybuffer",compression:"DEFLATE"});
 }
 
 /* Re-open the file we just made and compare it with what we meant to write. */
-async function verify(buf,{rows,heads}){
+async function verify(buf,{sheets,heads}){
   const wb=await readWorkbook(buf);
-  if(wb.sheets.length!==1)return"The file should have exactly one sheet.";
-  const g=await wb.load(wb.sheets[0]);
-  const h=g.rows[1]||[];
-  for(let c=0;c<heads.length;c++)if(h[c+1]!==heads[c])return`Header ${c+1} should be "${heads[c]}".`;
-  if(g.rows.length-2!==rows.length)return`Expected ${rows.length} data rows but found ${g.rows.length-2}.`;
-  for(let i=0;i<rows.length;i++){
-    const r=g.rows[i+2]||[];
-    if(r[5]!=null&&r[5]!=="")return`Planning Date is not empty on row ${i+2}.`;
-    for(let c=0;c<heads.length;c++){
-      if(c===4)continue;
-      const want=rows[i][c]==null||rows[i][c]===""?null:rows[i][c], got=r[c+1]??null;
-      if(want!==got&&clean(String(want))!==got)return`Row ${i+2}, "${heads[c]}" does not match the source.`;
+  if(wb.sheets.length!==sheets.length)return`Expected ${sheets.length} sheets but found ${wb.sheets.length}.`;
+  for(let k=0;k<sheets.length;k++){
+    const want=sheets[k], got=wb.sheets[k];
+    if(got.name!==want.name)return`Sheet ${k+1} should be named "${want.name}".`;
+    const g=await wb.load(got), h=g.rows[1]||[];
+    for(let c=0;c<heads.length;c++)if(h[c+1]!==heads[c])return`${want.name}: header ${c+1} should be "${heads[c]}".`;
+    if(g.rows.length-2!==want.rows.length)return`${want.name}: expected ${want.rows.length} data rows but found ${g.rows.length-2}.`;
+    for(let i=0;i<want.rows.length;i++){
+      const r=g.rows[i+2]||[];
+      if(r[5]!=null&&r[5]!=="")return`${want.name}: Planning Date is not empty on row ${i+2}.`;
+      for(let c=0;c<heads.length;c++){
+        if(c===4)continue;
+        const w=want.rows[i][c]==null||want.rows[i][c]===""?null:want.rows[i][c], v=r[c+1]??null;
+        if(w!==v&&clean(String(w))!==v)return`${want.name}, row ${i+2}, "${heads[c]}" does not match the source.`;
+      }
     }
   }
   return"";
@@ -376,7 +379,7 @@ async function download(){
   const m=$("dlmsg"); m.className="foot"; m.textContent="Building and checking the file...";
   try{
     const data=collect();
-    if(!data.rows.length){m.textContent="Nothing selected yet.";return}
+    if(!data.total){m.textContent="Nothing selected yet.";return}
     const buf=await buildXlsx(data), bad=await verify(buf.slice(0),data);
     if(bad){m.className="msg bad";m.textContent="The file failed its self-check, so it was not saved. "+bad;return}
     const tag=parsed.length===1?parsed[0].tag:"BOMs";
@@ -387,7 +390,7 @@ async function download(){
       const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name;
       document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),10000);
     }
-    m.className="ok"; m.textContent=`Saved. Checked: ${data.rows.length} rows, 8 columns, Planning Date empty. Open it in Excel and fill in the dates.`;
+    m.className="ok"; m.textContent=`Saved. Checked: ${data.total} rows on ${data.sheets.length} sheet${data.sheets.length>1?"s":""}, 8 columns, Planning Date empty. Open it in Excel and fill in the dates.`;
   }catch(e){
     console.error(e); window.__err=String(e&&e.stack||e);
     m.className="foot";
@@ -406,7 +409,7 @@ document.addEventListener("dragover",e=>e.preventDefault());
 document.addEventListener("drop",e=>e.preventDefault());
 $("files").onclick=e=>{const i=e.target.dataset.rm;if(i!=null){parsed.splice(+i,1);render()}};
 $("sheets").onchange=e=>{const k=e.target.dataset.sh;if(k){const[a,b]=k.split(":");parsed[a].sheets[b].on=e.target.checked;render()}};
-["sType","sLT","sQPU","sStart","sStep","sSrc"].forEach(id=>$(id).oninput=render);
+["sType","sLT","sQPU","sStart","sStep"].forEach(id=>$(id).oninput=render);
 $("dl").onclick=download;
 
 </script>
