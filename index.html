@@ -104,10 +104,11 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
     <div class="step"><b>2</b> Check what will be pulled (all goes into one sheet)</div>
     <div id="sheets" style="display:flex;flex-direction:column;gap:12px"></div>
     <details>
-      <summary>Settings for columns the BOM does not have</summary>
+      <summary>Settings (fixed values from the NAV work instruction)</summary>
       <div class="set">
         <label>Type<input id="sType" value="Item"></label>
-        <label>Line Type<input id="sLT" value="Budget"></label>
+        <label>Line Type<input id="sLT" value="Schedule"></label>
+        <label>Qty Per Unit<input id="sQPU" type="number" value="1" min="0" step="any"></label>
         <label style="flex-direction:row;align-items:center;gap:8px;grid-column:1/-1"><input id="sSrc" type="checkbox" style="width:auto"> Add a Source column showing which BOM tab each row came from</label>
         <label>Line No. starts at<input id="sStart" type="number" value="10000" min="0"></label>
         <label>Line No. step<input id="sStep" type="number" value="10000" min="1"></label>
@@ -129,12 +130,12 @@ summary{cursor:pointer;font-weight:500;color:var(--ink2)}
       <thead><tr><th>Output column</th><th>Taken from the BOM</th></tr></thead>
       <tbody>
         <tr><td>Line No.</td><td>Numbered automatically across the whole sheet: 10000, 20000, 30000...</td></tr>
-        <tr><td>Type</td><td>"Item" for every row (change in settings)</td></tr>
-        <tr><td>No.</td><td>NAV Part No. (left blank when the BOM has none)</td></tr>
-        <tr><td>Line Type</td><td>"Budget" for every row (change in settings)</td></tr>
+        <tr><td>Type</td><td>"Item" for every row</td></tr>
+        <tr><td>No.</td><td>NAV Part No. (left blank when the BOM has none, those items need an RFX)</td></tr>
+        <tr><td>Line Type</td><td>"Schedule" for every row</td></tr>
         <tr><td class="m">Planning Date</td><td class="m">Never pulled. Always empty, highlighted yellow for manual entry.</td></tr>
-        <tr><td>Qty Per Unit</td><td>Total Qty based on drawing</td></tr>
-        <tr><td>Quantity</td><td>Total Quantity</td></tr>
+        <tr><td>Qty Per Unit</td><td>1 for every row</td></tr>
+        <tr><td>Quantity</td><td>0x65 tasks (such as 0665): Total Qty based on drawing. 0x60 tasks (such as 0660): Total Committed Qty.</td></tr>
         <tr><td>Description</td><td>Description</td></tr>
       </tbody>
     </table></div>
@@ -146,10 +147,14 @@ const OUT=["Line No.","Type","No.","Line Type","Planning Date","Qty Per Unit","Q
 const ALIAS={
   "No.":["no","nav part no","part no","item no"],
   "Description":["description"],
-  "Qty Per Unit":["qty per unit","total qty based on drawing","qty per"],
-  "Quantity":["quantity","total quantity"],
+  "Qty Per Unit":["qty per unit"],
   "Type":["type"],"Line Type":["line type"]
 };
+/* Work Instruction 215448 (Material Entry into NAV), step 4.4.3:
+   0x65 tasks -> Quantity = "Total Qty based on drawing";  0x60 tasks -> Quantity = "Total Committed Qty". */
+const QTY_ANY=["quantity","total qty based on drawing","total committed qty","total quantity"];
+const QTY_COLS={"65":["total qty based on drawing"],"60":["total committed qty"],"":QTY_ANY};
+const QTY_HINT=["total quantity","quantity","total qty based on drawing","total committed qty","nav part no","no"];
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const norm=s=>String(s??"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim();
@@ -207,39 +212,56 @@ async function readWorkbook(buf){
 }
 
 /* ---------- finding and pulling the columns ---------- */
-function extract(g){
+function taskOf(g,hr,sheetName){
+  for(let r=1;r<hr;r++){
+    const row=g.rows[r]||[];
+    for(let c=0;c<row.length;c++){
+      if(norm(row[c])==="task no"){
+        for(let k=c+1;k<row.length;k++){const v=row[k];if(v!=null&&String(v).trim()!=="")return String(v).trim()}
+      }
+    }
+  }
+  return sheetName;
+}
+function extract(g,sheetName){
   let hr=0,cells=null;
   for(let r=1;r<=Math.min(40,g.rows.length-1);r++){
     const row=g.rows[r]; if(!row)continue;
     const m={};
     row.forEach((v,c)=>{const k=norm(v);if(k&&!(k in m))m[k]={col:c,orig:String(v).replace(/\s+/g," ").trim()}});
-    if(m["description"]&&["total quantity","quantity","nav part no","no"].some(k=>m[k])){hr=r;cells=m;break}
+    if(m["description"]&&QTY_HINT.some(k=>m[k])){hr=r;cells=m;break}
   }
   if(!hr)return{why:"no header row found (looked for Description and a quantity or part number column)"};
-  const col={},map={};
+  const task=taskOf(g,hr,sheetName), code=(String(task).match(/\d{4}/)||[""])[0];
+  const mode=/^\d{2}65$/.test(code)?"65":/^\d{2}60$/.test(code)?"60":"";
+  const col={},map={},warns=[],info=[];
   for(const [o,names] of Object.entries(ALIAS))for(const n of names)if(cells[n]){col[o]=cells[n].col;map[o]=cells[n].orig;break}
-  if(!col["Description"]||!col["Quantity"])return{why:"no Description or Quantity column"};
-  const st={read:0,kept:0,zero:0,nodesc:0,bad:0,unc:0}, rows=[];
+  let qk=QTY_COLS[mode].find(n=>cells[n]);
+  if(!qk&&mode){qk=QTY_ANY.find(n=>cells[n]);if(qk)warns.push(`Task ${code} should use "${mode==="65"?"Total Qty based on drawing":"Total Committed Qty"}" but that column is missing. Used "${cells[qk].orig}" instead.`)}
+  if(!col["Description"]||!qk)return{why:"no Description or Quantity column"};
+  col["Quantity"]=cells[qk].col; map["Quantity"]=cells[qk].orig;
+  const st={read:0,kept:0,zero:0,nodesc:0,bad:0,unc:0,nopart:0}, rows=[];
   for(let r=hr+1;r<g.rows.length;r++){
     const row=g.rows[r]||[], get=k=>col[k]!=null?row[col[k]]:null;
     const d=get("Description"), dOk=d!=null&&String(d).trim()!=="";
-    const qraw=get("Quantity"), q=num(qraw), isNum=typeof q==="number";
+    const q=num(get("Quantity")), isNum=typeof q==="number";
     if(!dOk&&!(isNum&&q>0))continue;                      // empty / template row
     st.read++;
     if(!dOk){st.nodesc++;continue}
     if(!isNum){ if(q!=null&&q!==""){st.bad++} else if(g.unc.has(r+":"+col["Quantity"])){st.unc++} else st.zero++; continue}
     if(q<=0){st.zero++;continue}
-    const no=get("No.");
-    rows.push({no:no!=null&&String(no).trim()!==""?String(no).trim():null,per:num(get("Qty Per Unit")),qty:q,desc:String(d).trim(),type:get("Type"),lt:get("Line Type")});
+    const no=get("No."), noS=no!=null&&String(no).trim()!==""?String(no).trim():null;
+    if(!noS)st.nopart++;
+    rows.push({no:noS,per:num(get("Qty Per Unit")),qty:q,desc:String(d).trim(),type:get("Type"),lt:get("Line Type")});
     st.kept++;
   }
-  const warns=[],info=[];
-  if(!col["Qty Per Unit"])warns.push("No Qty Per Unit column found in this tab, so that column is blank.");
   if(st.unc)warns.push(`${st.unc} row${st.unc>1?"s have":" has"} a quantity formula with no saved result. Open the BOM in Excel, save it, and add it again.`);
   if(st.nodesc)warns.push(`${st.nodesc} row${st.nodesc>1?"s have":" has"} a quantity but no description and ${st.nodesc>1?"were":"was"} skipped. Check the BOM.`);
   if(st.bad)warns.push(`${st.bad} row${st.bad>1?"s have":" has"} a quantity that is not a number (for example text) and ${st.bad>1?"were":"was"} skipped.`);
+  if(st.nopart)warns.push(`${st.nopart} item${st.nopart>1?"s have":" has"} no NAV Part No. They need an RFX to SCM first. They are kept in the file with No. blank.`);
+  if(!mode)info.push(`Task "${task}" is not a 0x65 or 0x60 task, so the first quantity column found was used.`);
   if(st.zero)info.push(`${st.zero} row${st.zero>1?"s":""} with a description but quantity 0 or blank left out.`);
-  return{rows,map,st,warns,info,hr};
+  return{rows,map,st,warns,info,hr,task,mode};
 }
 
 async function addFiles(list){
@@ -251,7 +273,7 @@ async function addFiles(list){
       const wb=await readWorkbook(await f.arrayBuffer()), sheets=[];
       for(const sh of wb.sheets){
         if(sh.state!=="visible")continue;
-        const g=await wb.load(sh), x=extract(g);
+        const g=await wb.load(sh), x=extract(g,sh.name);
         if(x.why)sheets.push({title:sh.name,rows:[],why:x.why,on:false});
         else sheets.push({title:sh.name,...x,why:x.rows.length?"":"no rows with a quantity above 0",on:x.rows.length>0});
       }
@@ -280,12 +302,12 @@ function render(){
 const totalRows=()=>parsed.reduce((a,p)=>a+p.sheets.filter(s=>s.on).reduce((x,s)=>x+s.rows.length,0),0);
 function sheetHTML(s,pi,si){
   if(!s.rows.length)return`<div class="sheet"><div class="sheet-h"><strong>${esc(s.title)}</strong><span class="skip">Skipped: ${esc(s.why)}</span></div>${(s.warns||[]).map(w=>`<p class="warn">${esc(w)}</p>`).join("")}</div>`;
-  const body=s.rows.slice(0,6).map((r,i)=>`<tr><td>${(+$("sStart").value||10000)+i*(+$("sStep").value||10000)}</td><td>${esc(r.type||$("sType").value)}</td><td>${esc(r.no||"")}</td><td>${esc(r.lt||$("sLT").value)}</td><td class="m">enter manually</td><td>${r.per??""}</td><td>${r.qty}</td><td class="d">${esc(r.desc.split("\n")[0])}</td></tr>`).join("");
-  const mp=["No.","Qty Per Unit","Quantity","Description"].map(k=>s.map[k]?`${k} ← ${esc(s.map[k])}`:"").filter(Boolean).join(" · ");
+  const body=s.rows.slice(0,6).map((r,i)=>`<tr><td>${(+$("sStart").value||10000)+i*(+$("sStep").value||10000)}</td><td>${esc(r.type||$("sType").value)}</td><td>${esc(r.no||"")}</td><td>${esc(r.lt||$("sLT").value)}</td><td class="m">enter manually</td><td>${r.per??(+$("sQPU").value||1)}</td><td>${r.qty}</td><td class="d">${esc(r.desc.split("\n")[0])}</td></tr>`).join("");
+  const mp=["No.","Quantity","Description"].map(k=>s.map[k]?`${k} ← ${esc(s.map[k])}`:"").filter(Boolean).join(" · ");
   return`<div class="sheet"><div class="sheet-h"><label><input type="checkbox" data-sh="${pi}:${si}" ${s.on?"checked":""}> ${esc(s.title)}</label><span class="meta">${s.rows.length} row${s.rows.length>1?"s":""}</span></div>
   <div class="tw"><table><thead><tr>${OUT.map(h=>`<th${h==="Planning Date"?' class="m"':""}>${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>
   ${s.rows.length>6?`<div class="more">Showing 6 of ${s.rows.length} rows. All rows go into the file.</div>`:""}
-  ${s.warns.map(w=>`<p class="warn">${esc(w)}</p>`).join("")}${s.info.map(w=>`<p class="info">${esc(w)}</p>`).join("")}<p class="info">Columns used: ${mp}</p></div>`;
+  ${s.warns.map(w=>`<p class="warn">${esc(w)}</p>`).join("")}${s.info.map(w=>`<p class="info">${esc(w)}</p>`).join("")}<p class="info">Task ${esc(s.task)}${s.mode?` (0x${s.mode} task)`:""}. Columns used: ${mp}</p></div>`;
 }
 
 /* ---------- writing the .xlsx ---------- */
@@ -300,12 +322,12 @@ function cellXML(ref,v,s){
 const STYLES=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color rgb="FFBBBBBB"/></left><right style="thin"><color rgb="FFBBBBBB"/></right><top style="thin"><color rgb="FFBBBBBB"/></top><bottom style="thin"><color rgb="FFBBBBBB"/></bottom><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="5"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="3" borderId="1" xfId="0" applyNumberFormat="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
 
 function collect(){
-  const start=+$("sStart").value||10000, step=+$("sStep").value||10000, type=$("sType").value, lt=$("sLT").value;
+  const start=+$("sStart").value||10000, step=+$("sStep").value||10000, type=$("sType").value, lt=$("sLT").value, qpu=+$("sQPU").value||1;
   const src=$("sSrc").checked, multi=parsed.length>1, rows=[]; let i=0;
   for(const p of parsed)for(const s of p.sheets){
     if(!s.on)continue;
     for(const r of s.rows){
-      const row=[start+i*step,r.type||type,r.no,r.lt||lt,null,r.per,r.qty,r.desc];
+      const row=[start+i*step,r.type||type,r.no,r.lt||lt,null,r.per!=null&&r.per!==""?r.per:qpu,r.qty,r.desc];
       if(src)row.push(multi?p.tag+" / "+s.title:s.title);
       rows.push(row); i++;
     }
@@ -384,7 +406,7 @@ document.addEventListener("dragover",e=>e.preventDefault());
 document.addEventListener("drop",e=>e.preventDefault());
 $("files").onclick=e=>{const i=e.target.dataset.rm;if(i!=null){parsed.splice(+i,1);render()}};
 $("sheets").onchange=e=>{const k=e.target.dataset.sh;if(k){const[a,b]=k.split(":");parsed[a].sheets[b].on=e.target.checked;render()}};
-["sType","sLT","sStart","sStep","sSrc"].forEach(id=>$(id).oninput=render);
+["sType","sLT","sQPU","sStart","sStep","sSrc"].forEach(id=>$(id).oninput=render);
 $("dl").onclick=download;
 
 </script>
